@@ -18,6 +18,10 @@ import traceback
 from collections import defaultdict
 import errno
 
+# Added some libraries
+from os import listdir
+from os.path import isfile, join,isdir
+
 need_reset = True
 screen = None
 http_stats = False
@@ -51,10 +55,24 @@ def exc_hook(type, value, tb):
 
 sys.excepthook = exc_hook
 
+# (Alexander)
+def check_args(args):
+	""" 
+	If in args passed socket file return for example ["/tmp/socket.sock"]
+	elif passed directory function return list of socket files in that directory ["/tmp/socket.sock","/tmp/socket1.sock","/tmp/socket2.sock"] 
+	"""
+	if not isdir(args):
+		return [args]
+	else:
+		onlyfiles = [join(args, f) for f in listdir(args) if isdir(args)]
+		return onlyfiles
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--frequency', type=int, default=1, help='Refresh frequency in seconds')
-    parser.add_argument('address', help='uWSGI stats socket or address')
+    # Added lambda function to modify passed arguments with check_args() function (Alexander)
+    parser.add_argument('address', help='uWSGI stats socket or address',
+                        type = lambda add: check_args(add))
 
     return parser.parse_args()
 
@@ -76,16 +94,25 @@ def abstract_unix_addr(arg):
     addr = '\0' + arg[1:]
     return sfamily, addr, socket.gethostname()
 
-if args.address.startswith('http://'):
-    http_stats = True
-    addr = args.address
-    host = addr.split('//')[1].split(':')[0]
-elif ':' in args.address:
-    sfamily, addr, host = inet_addr(args.address)
-elif args.address.startswith('@'):
-    sfamily, addr, host = abstract_unix_addr(args.address)
-else:
-    sfamily, addr, host = unix_addr(args.address)
+# List of vassal info (Alexander)
+vassals = []
+
+# Iterating throught list of sockets and appending in vassals list (Alexander)
+for arg in args.address:
+    if arg.startswith('http://'):
+        http_stats = 'True'
+        addr = arg
+        host = addr.split('//')[1].split(':')[0]
+        vassals.append((http_stats,addr,host))
+    elif ':' in arg:
+        sfamily, addr, host = inet_addr(arg)
+        vassals.append((sfamily, addr, host))
+    elif arg.startswith('@'):
+        sfamily, addr, host = abstract_unix_addr(arg)
+        vassals.append((sfamily, addr, host))
+    else:
+        sfamily, addr, host = unix_addr(arg)
+        vassals.append((sfamily, addr, host))
 
 screen = curses.initscr()
 curses.noecho()
@@ -123,8 +150,9 @@ def calc_percent(tot, req):
         return 0.0
     return (100 * float(req)) / float(tot)
 
-def merge_worker_with_cores(workers, rps_per_worker, cores, rps_per_core):
-    workers_by_id = dict([(w['id'], w) for w in workers])
+def merge_worker_with_cores(workers, rps_per_worker, cores, rps_per_core,number):
+    # Added number to worker id to differentiate vassal workers from each other. (Alexander)
+    workers_by_id = dict([(w['id']+number, w) for w in workers])
     new_workers = []
     for wid, w_cores in cores.items():
         for core in w_cores:
@@ -151,7 +179,6 @@ async_mode = 0
 fast_screen = 0
 
 while True:
-
     if fast_screen == 1:
         screen.timeout(100)
     else:
@@ -159,165 +186,198 @@ while True:
 
     screen.clear()
 
-    js = ''
+    # Step needed to separate vassals ouput (Alexander)
+    step = 0
+    # Iterating throught vassals list passing arguments in sfamily, addr,host (Alexander)
+    for position,value in enumerate(vassals):
 
-    try:
-        if http_stats:
-            r = urllib2.urlopen(addr)
-            js = r.read().decode('utf8', 'ignore')
-        else:
-            s = socket.socket(sfamily, socket.SOCK_STREAM)
-            s.connect(addr)
+        sfamily, addr,host  = value[0] ,value[1],value[2] 
+        # Getting vassal name from addr (Alexander)
+        try:
+            vassal_name = addr.split('/')[-1].split('.')[0]
+        except:
+            vassal_name = ''
+        js = ''
 
-            while True:
-                data = s.recv(4096)
-                if len(data) < 1:
-                    break
-                js += data.decode('utf8', 'ignore')
-            s.close()
-    except IOError as e:
-        if e.errno != errno.EINTR:
-            raise
-        continue
-    except:
-        raise Exception("unable to get uWSGI statistics")
-
-    dd = json.loads(js)
-
-    uversion = ''
-    if 'version' in dd:
-        uversion = '-' + dd['version']
-
-    if 'listen_queue' not in dd:
-        dd['listen_queue'] = 0
-
-    cwd = ""
-    if 'cwd' in dd:
-        cwd = "- cwd: %s" % dd['cwd']
-
-    uid = ""
-    if 'uid' in dd:
-        uid = "- uid: %d" % dd['uid']
-
-    gid = ""
-    if 'gid' in dd:
-        gid = "- gid: %d" % dd['gid']
-
-    masterpid = ""
-    if 'pid' in dd:
-        masterpid = "- masterpid: %d" % dd['pid']
-
-    screen.addstr(1, 0, "node: %s %s %s %s %s" % (host, cwd, uid, gid, masterpid))
-
-    if 'vassals' in dd:
-        screen.addstr(0, 0, "uwsgi%s - %s - emperor: %s - tyrant: %d" % (uversion, time.ctime(), dd['emperor'], dd['emperor_tyrant']))
-        if dd['vassals']:
-            vassal_spaces = max([len(v['id']) for v in dd['vassals']])
-            screen.addstr(2, 0, " VASSAL%s\tPID\t" % (' ' * (vassal_spaces-6)), curses.A_REVERSE)
-            pos = 3
-            for vassal in dd['vassals']:
-                screen.addstr(pos, 0, " %s\t%d" % (vassal['id'].ljust(vassal_spaces), vassal['pid']))
-                pos += 1
-
-    elif 'workers' in dd:
-        tot = sum([worker['requests'] for worker in dd['workers']])
-
-        rps_per_worker = {}
-        rps_per_core = {}
-        cores = defaultdict(list)
-        dt = time.time() - last_tot_time
-        total_rps = 0
-        for worker in dd['workers']:
-            wid = worker['id']
-            curr_reqnumber = worker['requests']
-            last_reqnumber = last_reqnumber_per_worker[wid]
-            rps_per_worker[wid] = (curr_reqnumber - last_reqnumber) / dt
-            total_rps += rps_per_worker[wid]
-            last_reqnumber_per_worker[wid] = curr_reqnumber
-            if not async_mode:
-                continue
-            for core in worker.get('cores', []):
-                if not core['requests']:
-                    # ignore unused cores
-                    continue
-                wcid = (wid, core['id'])
-                curr_reqnumber = core['requests']
-                last_reqnumber = last_reqnumber_per_core[wcid]
-                rps_per_core[wcid] = (curr_reqnumber - last_reqnumber) / dt
-                last_reqnumber_per_core[wcid] = curr_reqnumber
-                cores[wid].append(core)
-            cores[wid].sort(key=reqcount)
-
-        last_tot_time = time.time()
-
-        if async_mode == 1:
-            merge_worker_with_cores(dd['workers'], rps_per_worker,
-                                    cores, rps_per_core)
-
-        tx = human_size(sum([worker['tx'] for worker in dd['workers']]))
-        screen.addstr(0, 0, "uwsgi%s - %s - req: %d - RPS: %d - lq: %d - tx: %s" % (uversion, time.ctime(), tot, int(round(total_rps)), dd['listen_queue'], tx))
-        screen.addstr(2, 0, " WID\t%\tPID\tREQ\tRPS\tEXC\tSIG\tSTATUS\tAVG\tRSS\tVSZ\tTX\tReSpwn\tHC\tRunT\tLastSpwn", curses.A_REVERSE)
-        pos = 3
-
-        dd['workers'].sort(key=reqcount, reverse=True)
-        for worker in dd['workers']:
-            sigs = 0
-            wtx = human_size(worker['tx'])
-            wlastspawn = "--:--:--"
-
-            wrunt = worker['running_time']/1000
-            if wrunt > 9999999:
-                wrunt = "%sm" % str(wrunt / (1000*60))
+        try:
+            if sfamily == 'True':
+                r = urllib2.urlopen(addr)
+                js = r.read().decode('utf8', 'ignore')
             else:
-                wrunt = str(wrunt)
+                s = socket.socket(sfamily, socket.SOCK_STREAM)
+                s.connect(addr)
 
-            if worker['last_spawn']:
-                wlastspawn = time.strftime("%H:%M:%S", time.localtime(worker['last_spawn']))
+                while True:
+                    data = s.recv(4096)
+                    if len(data) < 1:
+                        break
+                    js += data.decode('utf8', 'ignore')
+                s.close()
+        except IOError as e:
+            if e.errno != errno.EINTR:
+                raise
+            continue
+        except:
+            raise Exception("unable to get uWSGI statistics")
 
-            color = curses.color_pair(0)
-            if 'signals' in worker:
-                sigs = worker['signals']
-            if worker['status'] == 'busy':
-                color = curses.color_pair(1)
-            if worker['status'] == 'cheap':
-                color = curses.color_pair(2)
-            if worker['status'].startswith('sig'):
-                color = curses.color_pair(4)
-            if worker['status'] == 'pause':
-                color = curses.color_pair(5)
+        dd = json.loads(js)
+        
+        # Separate vassals output when workers number are different per vassal (Alexander)
+        worker_number = len(dd['workers'])
 
-            wid = worker['id']
+        uversion = ''
+        if 'version' in dd:
+            uversion = '-' + dd['version']
 
-            rps = int(round(rps_per_worker[wid]))
+        if 'listen_queue' not in dd:
+            dd['listen_queue'] = 0
 
-            try:
-                screen.addstr(pos, 0, " %s\t%.1f\t%d\t%d\t%d\t%d\t%d\t%s\t%dms\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
-                    wid, calc_percent(tot, worker['requests']),  worker['pid'], worker['requests'], rps, worker['exceptions'], sigs, worker['status'],
-                    worker['avg_rt']/1000, human_size(worker['rss']), human_size(worker['vsz']),
-                    wtx, worker['respawn_count'], worker['harakiri_count'], wrunt, wlastspawn
-                ), color)
-            except:
-                pass
-            pos += 1
-            if async_mode != 2:
-                continue
-            for core in cores[wid]:
-                color = curses.color_pair(0)
-                if core['in_request']:
-                    status = 'busy'
-                    color = curses.color_pair(1)
+        cwd = ""
+        if 'cwd' in dd:
+            cwd = "- cwd: %s" % dd['cwd']
+
+        uid = ""
+        if 'uid' in dd:
+            uid = "- uid: %d" % dd['uid']
+
+        gid = ""
+        if 'gid' in dd:
+            gid = "- gid: %d" % dd['gid']
+
+        masterpid = ""
+        if 'pid' in dd:
+            masterpid = "- masterpid: %d" % dd['pid']
+        
+        # Printing vassals name (Alexander)
+        # Also adding step to all vassal output Y position. (Alexander)
+        # For first vassal position will be 0 + vassal worker quantity +5 (Alexander)
+        screen.addstr(0+step, 0, 'Vassal Name: %s'%(vassal_name),curses.color_pair(4)|curses.A_BOLD)
+
+        screen.addstr(2+step, 0, "node: %s %s %s %s %s" % (host, cwd, uid, gid, masterpid))
+
+        if 'vassals' in dd:
+            screen.addstr(0, 0, "uwsgi%s - %s - emperor: %s - tyrant: %d" % (uversion, time.ctime(), dd['emperor'], dd['emperor_tyrant']))
+            if dd['vassals']:
+                vassal_spaces = max([len(v['id']) for v in dd['vassals']])
+                screen.addstr(2, 0, " VASSAL%s\tPID\t" % (' ' * (vassal_spaces-6)), curses.A_REVERSE)
+                pos = 3
+                for vassal in dd['vassals']:
+                    screen.addstr(pos, 0, " %s\t%d" % (vassal['id'].ljust(vassal_spaces), vassal['pid']))
+                    pos += 1
+
+        elif 'workers' in dd:
+            tot = sum([worker['requests'] for worker in dd['workers']])
+
+            rps_per_worker = {}
+            rps_per_core = {}
+            cores = defaultdict(list)
+            dt = time.time() - last_tot_time
+            total_rps = 0
+            for worker in dd['workers']:
+            	# Adding position to worker id to differentiate workirs rps (Alexander)
+
+                wid = worker['id'] + step
+
+                curr_reqnumber = worker['requests']
+                last_reqnumber = last_reqnumber_per_worker[wid]
+                rps_per_worker[wid] = (curr_reqnumber - last_reqnumber) / dt
+                total_rps += rps_per_worker[wid]
+                last_reqnumber_per_worker[wid] = curr_reqnumber
+                if not async_mode:
+                    continue
+                for core in worker.get('cores', []):
+                    if not core['requests']:
+                        # ignore unused cores
+                        continue
+                    wcid = (wid, core['id'])
+                    curr_reqnumber = core['requests']
+                    last_reqnumber = last_reqnumber_per_core[wcid]
+                    rps_per_core[wcid] = (curr_reqnumber - last_reqnumber) / dt
+                    last_reqnumber_per_core[wcid] = curr_reqnumber
+                    cores[wid].append(core)
+                cores[wid].sort(key=reqcount)
+
+            last_tot_time = time.time()
+
+            if async_mode == 1:
+                merge_worker_with_cores(dd['workers'], rps_per_worker,
+                                        cores, rps_per_core,step)
+
+            tx = human_size(sum([worker['tx'] for worker in dd['workers']]))
+            screen.addstr(1 + step, 0, "uwsgi%s - %s - req: %d - RPS: %d - lq: %d - tx: %s" % (uversion, time.ctime(), tot, int(round(total_rps)), dd['listen_queue'], tx))
+            screen.addstr(3 + step, 0, " WID\t%\tPID\tREQ\tRPS\tEXC\tSIG\tSTATUS\tAVG\tRSS\tVSZ\tTX\tReSpwn\tHC\tRunT\tLastSpwn", curses.A_REVERSE)
+            pos = 4
+
+            dd['workers'].sort(key=reqcount, reverse=True)
+            for worker in dd['workers']:
+                sigs = 0
+                wtx = human_size(worker['tx'])
+                wlastspawn = "--:--:--"
+
+                wrunt = worker['running_time']/1000
+                if wrunt > 9999999:
+                    wrunt = "%sm" % str(wrunt / (1000*60))
                 else:
-                    status = 'idle'
+                    wrunt = str(wrunt)
 
-                cid = core['id']
-                rps = int(round(rps_per_core[wid, cid]))
+                if worker['last_spawn']:
+                    wlastspawn = time.strftime("%H:%M:%S", time.localtime(worker['last_spawn']))
+
+                color = curses.color_pair(0)
+                if 'signals' in worker:
+                    sigs = worker['signals']
+                if worker['status'] == 'busy':
+                    color = curses.color_pair(1)
+                if worker['status'] == 'cheap':
+                    color = curses.color_pair(2)
+                if worker['status'].startswith('sig'):
+                    color = curses.color_pair(4)
+                if worker['status'] == 'pause':
+                    color = curses.color_pair(5)
+
+                # Also Adding position here (Alexander)
                 try:
-                    screen.addstr(pos, 0, "  :%s\t%.1f\t-\t%d\t%d\t-\t-\t%s\t-\t-\t-\t-\t-" % (
-                        cid, calc_percent(tot, core['requests']),  core['requests'], rps, status,
+                    wid = worker['id'] + step
+                except :
+                    wid = worker['id']
+
+                rps = int(round(rps_per_worker[wid]))
+
+                try:
+                    screen.addstr(pos + step, 0, " %s\t%.1f\t%d\t%d\t%d\t%d\t%d\t%s\t%dms\t%s\t%s\t%s\t%s\t%s\t%s\t%s" % (
+                        wid, calc_percent(tot, worker['requests']),  worker['pid'], worker['requests'], rps, worker['exceptions'], sigs, worker['status'],
+                        worker['avg_rt']/1000, human_size(worker['rss']), human_size(worker['vsz']),
+                        wtx, worker['respawn_count'], worker['harakiri_count'], wrunt, wlastspawn
                     ), color)
+                    screen.addstr(pos + step +1,0,"")
                 except:
                     pass
                 pos += 1
+                if async_mode != 2:
+                    continue
+                for core in cores[wid]:
+
+                    color = curses.color_pair(0)
+                    if core['in_request']:
+                        status = 'busy'
+                        color = curses.color_pair(1)
+                    else:
+                        status = 'idle'
+
+                    cid = core['id']
+                    rps = int(round(rps_per_core[wid, cid]))
+                    try:
+                        screen.addstr(pos+step, 0, " :%s\t%.1f\t-\t%d\t%d\t-\t-\t%s\t-\t-\t-\t-\t-" % (
+                            cid, calc_percent(tot, core['requests']),  core['requests'], rps, status,
+                        ), color)
+                    except:
+                        pass
+                    pos += 1 
+        # If async_mode ==2 we need twice more steps to separate vassals output (Alexander)
+        if  async_mode ==2:
+            step += 2*worker_number+5
+        else:
+            step += worker_number+5
 
     screen.refresh()
 
